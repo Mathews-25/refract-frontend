@@ -63,3 +63,8 @@ Other environment variables:
 ## License
 
 [MIT](./LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-218 -->
+- #218: Stream On-Chain Transaction Confirmation Status for User-Submitted Actions
