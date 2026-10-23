@@ -1,5 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
-import { mergeRealtimeEvent, type RealtimeEvent, type RealtimeState } from '../lib/realtime/merge';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { mergeRealtimeEvent, mergeSnapshot, type MergeFn, type RealtimeEvent, type RealtimeState } from '../lib/realtime/merge';
+import { getRegistry, type SubscriptionRegistry } from '../lib/realtime/registry';
+import type { RealtimeClient } from '../lib/realtime/client';
+
+export type RealtimeStatus = 'idle' | 'loading' | 'live' | 'polling' | 'error';
 
 export interface UseRealtimeTopicOptions<T> {
   /**
@@ -12,7 +16,33 @@ export interface UseRealtimeTopicOptions<T> {
    * Defaults to the merged state itself.
    */
   select?: (state: RealtimeState<T>) => RealtimeState<T>;
+  /** Fetches the REST snapshot used as the initial/fallback value. */
+  snapshotFetcher?: () => Promise<T>;
+  /** Merge rule applied to streamed events (defaults to latest-wins). */
+  merge?: MergeFn<T>;
+  /** When false the hook skips realtime and relies on polling only. */
+  enabled?: boolean;
+  /** Injectable polling strategy used when realtime is disabled/unavailable. */
+  pollIntervalMs?: number;
+  /** Whether the realtime feature flag is on. */
+  realtimeEnabled?: boolean;
+  /** Whether the realtime connection is healthy. */
+  connected?: boolean;
+  /** Subscribes to a topic; returns an unsubscribe function. */
+  subscribe?: (topic: string, onEvent: (event: T) => void) => () => void;
+  /** Realtime client used to resolve the shared subscription registry. */
+  client?: RealtimeClient;
+  /** Explicit registry override (tests / inspector). */
+  registry?: SubscriptionRegistry;
 }
+
+export interface UseRealtimeTopicResult<T> {
+  data: T | undefined;
+  status: RealtimeStatus;
+  lastEventAt: number | null;
+}
+
+const DEFAULT_POLL_INTERVAL_MS = 30_000;
 
 const isTestEnv = (): boolean => {
   if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test') {
@@ -44,7 +74,12 @@ const scheduleFrame = (cb: () => void): (() => void) => {
 };
 
 /**
- * Subscribe to a realtime topic and expose the merged state.
+ * Generic React binding over the realtime transport + merge layers.
+ *
+ * Subscribes on mount, tears down on unmount, reacts to connection health,
+ * and falls back to REST polling when realtime is disabled or unavailable.
+ * Subscriptions are routed through the shared registry so identical topics are
+ * reference-counted rather than opened per hook instance.
  *
  * Replaceable topics (e.g. oracle readings) are buffered and flushed at most
  * once per animation frame so high-frequency streams cannot cause render
@@ -54,23 +89,48 @@ const scheduleFrame = (cb: () => void): (() => void) => {
  */
 export function useRealtimeTopic<T>(
   topic: string,
-  initial: RealtimeState<T>,
   options: UseRealtimeTopicOptions<T> = {},
-): RealtimeState<T> {
-  const { replaceable = false, select } = options;
-  const [state, setState] = useState<RealtimeState<T>>(initial);
+): UseRealtimeTopicResult<T> {
+  const {
+    replaceable = false,
+    select,
+    snapshotFetcher,
+    merge,
+    enabled = true,
+    pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+    realtimeEnabled = true,
+    connected = true,
+    subscribe,
+    client,
+    registry,
+  } = options;
 
-  const stateRef = useRef<RealtimeState<T>>(initial);
-  const pendingRef = useRef<RealtimeState<T> | null>(null);
-  const cancelRef = useRef<(() => void) | null>(null);
+  const [data, setData] = useState<T | undefined>(undefined);
+  const [status, setStatus] = useState<RealtimeStatus>('idle');
+  const [lastEventAt, setLastEventAt] = useState<number | null>(null);
+
+  // Keep the latest merge/fetcher/select in refs so effects don't resubscribe
+  // on every render (avoids resubscribe storms).
+  const mergeRef = useRef(merge);
+  mergeRef.current = merge;
+  const fetcherRef = useRef(snapshotFetcher);
+  fetcherRef.current = snapshotFetcher;
   const selectRef = useRef(select);
   selectRef.current = select;
+
+  const pendingEventsRef = useRef<T[]>([]);
+  const mountedRef = useRef(true);
+
+  // Coalescing state for replaceable topics.
+  const stateRef = useRef<RealtimeState<T> | undefined>(undefined);
+  const pendingRef = useRef<RealtimeState<T> | null>(null);
+  const cancelRef = useRef<(() => void) | null>(null);
 
   const coalesce = replaceable && !isTestEnv() && !prefersReducedMotion();
   const coalesceRef = useRef(coalesce);
   coalesceRef.current = coalesce;
 
-  const flush = (): void => {
+  const flush = useCallback((): void => {
     cancelRef.current = null;
     const next = pendingRef.current;
     if (next === null) {
@@ -78,30 +138,81 @@ export function useRealtimeTopic<T>(
     }
     pendingRef.current = null;
     stateRef.current = next;
-    setState(next);
-  };
+    if (mountedRef.current) {
+      setData(next as unknown as T);
+    }
+  }, []);
 
-  const apply = (next: RealtimeState<T>): void => {
+  const apply = useCallback((next: RealtimeState<T>): void => {
     if (!coalesceRef.current) {
       stateRef.current = next;
-      setState(next);
+      if (mountedRef.current) {
+        setData(next as unknown as T);
+      }
       return;
     }
     pendingRef.current = next;
     if (cancelRef.current === null) {
       cancelRef.current = scheduleFrame(flush);
     }
-  };
+  }, [flush]);
 
+  const applyEvent = useCallback((event: T) => {
+    if (!mountedRef.current) return;
+    const current = stateRef.current;
+    const merged = current !== undefined
+      ? mergeRealtimeEvent(current, event as unknown as RealtimeEvent<T>)
+      : (event as unknown as RealtimeState<T>);
+    const selected = selectRef.current ? selectRef.current(merged) : merged;
+    apply(selected);
+    setLastEventAt(Date.now());
+  }, [apply]);
+
+  const fetchSnapshot = useCallback(async () => {
+    const fetcher = fetcherRef.current;
+    if (!fetcher) return;
+    try {
+      const snapshot = await fetcher();
+      if (!mountedRef.current) return;
+      const pending = pendingEventsRef.current;
+      pendingEventsRef.current = [];
+      const merged = mergeSnapshot(snapshot, pending, mergeRef.current);
+      stateRef.current = merged as unknown as RealtimeState<T>;
+      setData(merged);
+    } catch {
+      if (mountedRef.current) setStatus('error');
+    }
+  }, []);
+
+  // Resolve the registry: explicit override, else the shared registry bound to
+  // the client. Falls back to a direct subscribe when neither is available.
+  const resolvedRegistry = registry ?? (client ? getRegistry(client) : undefined);
+  const subscribeFn = resolvedRegistry
+    ? (t: string, onEvent: (event: T) => void) => resolvedRegistry.subscribe<T>(t, onEvent)
+    : subscribe;
+
+  const realtimeActive = enabled && realtimeEnabled && connected && !!subscribeFn;
+
+  // Snapshot fetch on mount / when the topic changes.
   useEffect(() => {
-    const handler = (event: RealtimeEvent<T>): void => {
-      const merged = mergeRealtimeEvent(stateRef.current, event);
-      const selected = selectRef.current ? selectRef.current(merged) : merged;
-      apply(selected);
+    mountedRef.current = true;
+    setStatus('loading');
+    void fetchSnapshot();
+    return () => {
+      mountedRef.current = false;
     };
+  }, [topic, fetchSnapshot]);
 
-    const unsubscribe = subscribeToTopic(topic, handler);
-
+  // Realtime subscription lifecycle (routed through the registry).
+  useEffect(() => {
+    if (!realtimeActive || !subscribeFn) return;
+    setStatus('live');
+    const unsubscribe = subscribeFn(topic, (event) => {
+      if (pendingEventsRef.current.length > 0) {
+        pendingEventsRef.current.push(event);
+      }
+      applyEvent(event);
+    });
     return () => {
       unsubscribe();
       if (cancelRef.current !== null) {
@@ -111,10 +222,19 @@ export function useRealtimeTopic<T>(
       // Trailing-edge flush on unmount so the latest value is never stranded.
       flush();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [topic]);
+  }, [topic, realtimeActive, subscribeFn, applyEvent, flush]);
 
-  return state;
+  // REST polling fallback when realtime is disabled or unavailable.
+  useEffect(() => {
+    if (!enabled || realtimeActive) return;
+    setStatus('polling');
+    const interval = setInterval(() => {
+      void fetchSnapshot();
+    }, pollIntervalMs);
+    return () => clearInterval(interval);
+  }, [enabled, realtimeActive, pollIntervalMs, fetchSnapshot]);
+
+  return { data, status, lastEventAt };
 }
 
 /**
@@ -129,8 +249,3 @@ export function useRealtimeFlush(): () => void {
   };
 }
 
-// Placeholder subscription seam; the real transport wires this up elsewhere.
-declare function subscribeToTopic<T>(
-  topic: string,
-  handler: (event: RealtimeEvent<T>) => void,
-): () => void;
